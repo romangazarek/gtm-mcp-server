@@ -77,7 +77,7 @@ The server ships opinionated best-practice rules as readable resources. **Read t
 
 Core rules in brief:
 - **Naming**: `<Platform> - <Type> - <Descriptor>` (e.g. `GA4 - Event - purchase`, `DLV - transaction_id`). Variables for every hardcoded ID.
-- **Safe edits**: dedicated workspace per change → make changes → show `get_workspace_status` diff to the user → `create_version` with descriptive name → `publish_version` only after explicit approval.
+- **Safe edits**: dedicated workspace per change → make changes → show the `get_workspace_changes` diff to the user → `create_version` with descriptive name → `publish_version` only after explicit approval.
 - **GA4**: one config tag with the measurement ID from a lookup table variable (`LT - GA4 Measurement ID`) keyed on hostname/environment; event parameters from data layer variables; consent mode tags fire on Consent Initialization.
 - **Existing conventions win**: if the container already follows a different consistent convention, match it and flag the difference instead of mixing conventions.
 

@@ -145,7 +145,7 @@ gtm://best-practices/ga4-consent            # GA4 tag patterns, consent mode v2,
 gtm://best-practices/server-side            # Clients, transformations, PII redaction, first-party domains
 ```
 
-Read the relevant best-practices document before creating or editing entities. Key rules: name entities `<Platform> - <Type> - <Descriptor>` (e.g. `GA4 - Event - purchase`, `DLV - transaction_id`); source measurement IDs from a lookup table or constant variable, never a literal in the tag; make changes in a dedicated workspace and show the `get_workspace_status` diff before versioning; publish only with explicit user approval. If the container already follows a different consistent convention, match it instead.
+Read the relevant best-practices document before creating or editing entities. Key rules: name entities `<Platform> - <Type> - <Descriptor>` (e.g. `GA4 - Event - purchase`, `DLV - transaction_id`); source measurement IDs from a lookup table or constant variable, never a literal in the tag; make changes in a dedicated workspace and show the `get_workspace_changes` diff before versioning; publish only with explicit user approval. If the container already follows a different consistent convention, match it instead.
 
 ## Common Workflows
 
@@ -161,7 +161,7 @@ Read the relevant best-practices document before creating or editing entities. K
 3. Or manually: `list_tags` + `list_triggers` + `list_variables` and analyze
 
 ### Publish Changes
-1. `get_workspace_status` → verify no merge conflicts, review pending changes
+1. `get_workspace_changes` → review exactly which entities changed and verify no merge conflicts
 2. `create_version` → snapshot the workspace into a version
 3. `publish_version` with `confirm: true` → push the version live
 
@@ -179,7 +179,7 @@ Read the relevant best-practices document before creating or editing entities. K
 
 ## Safety Rules
 
-- **Always check status before versioning**: call `get_workspace_status` before `create_version`
+- **Always check status before versioning**: call `get_workspace_changes` (or `get_workspace_status` for counts only) before `create_version`
 - **Always version before publishing**: call `create_version` before `publish_version`
 - **Confirm destructive actions**: `delete_tag`, `delete_trigger`, `delete_variable`, `delete_container`, `delete_client`, `delete_transformation`, `disable_built_in_variables`, and `publish_version` all require `confirm: true`
 - **Create triggers before tags**: tags reference trigger IDs, so the trigger must exist first

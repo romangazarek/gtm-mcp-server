@@ -15,7 +15,9 @@ All GTM changes must follow this sequence. Never skip steps.
 
 ## 3. Review
 
-- Run `get_workspace_status` and present the pending changes to the user as a diff summary: what is added, modified, deleted.
+- Run `get_workspace_changes` and present the pending changes to the user as a diff summary: what is added, modified, deleted. It lists each changed entity by name and type, so the user can see the actual change rather than a count.
+- Pass `verbose: true` when the user needs a field-level diff of an entity body. Use `get_workspace_status` when you only need the counts.
+- A paused tag shows up as an `updated` change with `paused: true` — not as a deletion. Say so explicitly when presenting it.
 - If there are merge conflicts, resolve them before proceeding.
 - Do not proceed to versioning until the user has seen the summary.
 

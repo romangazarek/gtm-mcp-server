@@ -482,7 +482,7 @@ Apply this naming convention to any new entities:
 
 %s
 
-Produce a step-by-step execution plan with the exact tool calls (create_workspace, then entity creation in dependency order with proposed names, then get_workspace_status, create_version with a proposed version name, and finally publish_version pending my approval). Show me the plan before executing anything.`, containerID, accountID, changeDescription, workflow, naming),
+Produce a step-by-step execution plan with the exact tool calls (create_workspace, then entity creation in dependency order with proposed names, then get_workspace_changes to show me exactly what changed, create_version with a proposed version name, and finally publish_version pending my approval). Show me the plan before executing anything.`, containerID, accountID, changeDescription, workflow, naming),
 				},
 			},
 		},
