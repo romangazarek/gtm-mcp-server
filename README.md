@@ -446,6 +446,7 @@ This enables dynamic URL resolution for trusted internal hostnames while keeping
 | Tool | Description |
 |------|-------------|
 | `get_workspace_status` | Check pending changes and merge conflicts before versioning |
+| `get_workspace_changes` | List exactly which entities changed (added/updated/deleted) vs. the live version, with merge conflicts; `verbose` adds full entity bodies |
 | `list_versions` | List all container versions with tag/trigger/variable counts |
 | `create_version` | Create a version from workspace changes |
 | `publish_version` | Publish a version (requires confirmation) |

@@ -46,6 +46,7 @@ Always discover IDs by listing — never guess or hardcode them.
 | `get_folder_entities` | Get tags/triggers/variables in a specific folder |
 | `list_built_in_variables` | List enabled built-in variables |
 | `get_workspace_status` | Check pending changes and merge conflicts |
+| `get_workspace_changes` | List which entities changed (added/updated/deleted) vs. live; `verbose` for full bodies |
 
 ### Write Operations
 | Tool | Purpose |
@@ -85,6 +86,7 @@ Always discover IDs by listing — never guess or hardcode them.
 | Tool | Purpose |
 |------|---------|
 | `get_workspace_status` | Check pending changes and conflicts before versioning |
+| `get_workspace_changes` | List exactly which entities changed vs. live (added/updated/deleted) + conflicts; `verbose` for full bodies |
 | `create_version` | Create a version from workspace changes |
 | `publish_version` | Publish a version to go live (requires `confirm: true`) |
 | `list_versions` | List all container versions |

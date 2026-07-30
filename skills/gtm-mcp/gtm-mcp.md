@@ -61,6 +61,8 @@ This is a three-step process. Never skip steps.
 
 If `get_workspace_status` shows conflicts, resolve them before versioning.
 
+To review *which* entities changed (not just how many), use `get_workspace_changes` — it returns a compact per-entity list (`changeStatus`, `entityType`, `entityId`, `name`, plus `paused` for tags). Pass `verbose: true` for full entity bodies (including `fingerprint`) when you need a field-level diff. Note: pausing a tag is an `updated` change with `paused: true`, not a `deleted` one.
+
 ## Configuration Standards
 
 The server ships opinionated best-practice rules as readable resources. **Read the relevant one before creating or editing entities:**

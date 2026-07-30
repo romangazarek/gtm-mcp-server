@@ -45,6 +45,7 @@ func RegisterTools(server *mcp.Server) {
 
 	// Workspace status
 	registerGetWorkspaceStatus(server)
+	registerGetWorkspaceChanges(server)
 
 	// Version operations
 	registerCreateVersion(server)
