@@ -30,5 +30,8 @@ docker-compose.yml
 *.swp
 *.swo
 
+# macOS
+.DS_Store
+
 # MCP Registry tokens
 .mcpregistry_*
