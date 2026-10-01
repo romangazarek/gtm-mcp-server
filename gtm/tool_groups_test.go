@@ -74,11 +74,11 @@ func TestRegisterToolsForGroupsIsolatesSelectedFamily(t *testing.T) {
 func TestDefaultPreservesSurfaceAndAllIncludesOptionalGroups(t *testing.T) {
 	defaults, _ := ParseToolGroups(nil)
 	all, _ := ParseToolGroups([]string{"all"})
-	if got := registeredToolCount(t, defaults); got != 64 {
-		t.Fatalf("default=%d, want 64", got)
+	if got := registeredToolCount(t, defaults); got != 65 {
+		t.Fatalf("default=%d, want 65", got)
 	}
-	if got := registeredToolCount(t, all); got != 94 {
-		t.Fatalf("all=%d, want 94", got)
+	if got := registeredToolCount(t, all); got != 95 {
+		t.Fatalf("all=%d, want 95", got)
 	}
 }
 
