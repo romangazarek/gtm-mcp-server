@@ -1,5 +1,5 @@
 # Build stage (using Google mirror to avoid Docker Hub rate limits)
-FROM mirror.gcr.io/library/golang:1.25-alpine AS builder
+FROM mirror.gcr.io/library/golang:1.26-alpine AS builder
 
 WORKDIR /app
 
@@ -27,8 +27,8 @@ RUN apk add --no-cache ca-certificates tzdata
 # Copy binary from builder
 COPY --from=builder /app/gtm-mcp-server .
 
-# Create non-root user
-RUN adduser -D -g '' appuser
+# Create non-root user and a writable data directory for TOKEN_STORE_PATH
+RUN adduser -D -g '' appuser && mkdir -p /data && chown appuser:appuser /data && chmod 700 /data
 USER appuser
 
 # Expose port

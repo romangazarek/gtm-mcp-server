@@ -5,9 +5,11 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 )
@@ -114,6 +116,142 @@ func TestCIMDFetcher_Fetch_RejectsPrivateHostsByDefault(t *testing.T) {
 	}
 }
 
+// A redirect must not be able to walk the fetch off https onto an internal
+// plain-http endpoint. Asserts the target was never contacted, not merely that
+// Fetch returned some error — an unreachable target would fail either way.
+func TestCIMDFetcher_Fetch_DoesNotFollowRedirectToNonHTTPS(t *testing.T) {
+	var targetHits int
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		targetHits++
+		w.Write([]byte("internal"))
+	}))
+	defer target.Close()
+
+	fetcher, u, cleanup := newCIMDTestServer(t, "/client.json", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL+"/latest/meta-data/", http.StatusFound)
+	})
+	defer cleanup()
+
+	_, err := fetcher.Fetch(context.Background(), u)
+	if err == nil {
+		t.Error("expected an error when the metadata document redirects to http")
+	}
+	if targetHits != 0 {
+		t.Errorf("redirect target was contacted %d times, want 0", targetHits)
+	}
+}
+
+// The https case: the redirect stays on https but points at a private address.
+// Exercised directly because the AllowPrivateHosts escape hatch that lets the
+// httptest server (127.0.0.1) be reached at all would also skip this check.
+func TestCIMDFetcher_CheckRedirect_RejectsPrivateHost(t *testing.T) {
+	f := NewCIMDFetcher()
+	req := httptest.NewRequest(http.MethodGet, "https://127.0.0.1/latest/meta-data/", nil)
+
+	if err := f.checkRedirect(req, nil); err == nil {
+		t.Error("expected an https redirect to a loopback address to be rejected")
+	}
+}
+
+func TestCIMDFetcher_CheckRedirect_RejectsTooManyHops(t *testing.T) {
+	f := NewCIMDFetcher()
+	f.AllowPrivateHosts = true
+	req := httptest.NewRequest(http.MethodGet, "https://example.com/next", nil)
+
+	via := make([]*http.Request, cimdMaxRedirects)
+	if err := f.checkRedirect(req, via); err == nil {
+		t.Errorf("expected rejection after %d hops", cimdMaxRedirects)
+	}
+	if err := f.checkRedirect(req, via[:1]); err != nil {
+		t.Errorf("a single hop to a public https host should be allowed, got %v", err)
+	}
+}
+
+// The dial-time guard sees the address actually being connected to, so it
+// covers both redirect targets and DNS rebinding, which rejectPrivateHost
+// (name-based, pre-flight) cannot.
+func TestRejectPrivateAddr(t *testing.T) {
+	tests := []struct {
+		address string
+		wantErr bool
+	}{
+		{"93.184.216.34:443", false}, // public
+		{"[2606:2800:220:1:248:1893:25c8:1946]:443", false},
+		{"127.0.0.1:80", true},
+		{"169.254.169.254:80", true}, // cloud metadata service
+		{"10.0.0.5:443", true},
+		{"192.168.1.1:443", true},
+		{"172.16.0.1:443", true},
+		{"[::1]:443", true},
+		{"[fd00::1]:443", true}, // IPv6 unique-local
+		{"0.0.0.0:80", true},
+		{"[::ffff:127.0.0.1]:80", true}, // IPv4-mapped loopback
+
+		// Ranges net.IP's own helpers do not classify. IsPrivate covers only
+		// RFC1918 and fc00::/7, so these reach real infrastructure otherwise.
+		{"100.64.0.1:80", true},           // RFC 6598 CGNAT (AWS/GCP/k8s NAT)
+		{"[64:ff9b::a9fe:a9fe]:80", true}, // NAT64 of 169.254.169.254
+		{"192.0.0.1:80", true},            // IETF protocol assignments
+		{"198.18.0.1:80", true},           // benchmarking
+		{"240.0.0.1:80", true},            // class E
+		{"255.255.255.255:80", true},      // broadcast
+		{"[2002:7f00:1::]:80", true},      // 6to4 of 127.0.0.1
+		{"224.0.0.1:80", true},            // multicast
+		{"[ff02::1]:80", true},            // link-local multicast
+
+		// IPv4-compatible IPv6 (::a.b.c.d). To4() normalizes only the
+		// ::ffff: form, so no net.IP helper fires on these.
+		{"[::7f00:1]:80", true},    // 127.0.0.1
+		{"[::a9fe:a9fe]:80", true}, // 169.254.169.254
+		{"192.88.99.1:80", true},   // 6to4 relay anycast
+		{"[2001::1]:80", true},     // Teredo
+		{"[2001:10::1]:80", true},  // ORCHID
+	}
+
+	for _, tt := range tests {
+		err := rejectPrivateAddr("tcp", tt.address, nil)
+		if (err != nil) != tt.wantErr {
+			t.Errorf("rejectPrivateAddr(%q) error = %v, wantErr %v", tt.address, err, tt.wantErr)
+		}
+	}
+}
+
+func TestCIMDFetcher_DefaultTransportGuardsDialAddress(t *testing.T) {
+	// Dial a listener that is genuinely accepting connections, so an
+	// unguarded transport would succeed here. Dialling a closed port would
+	// fail with "connection refused" either way and prove nothing.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to open listener: %v", err)
+	}
+	defer ln.Close()
+
+	f := NewCIMDFetcher()
+	tr, ok := f.HTTPClient.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("default HTTPClient.Transport is %T, want *http.Transport", f.HTTPClient.Transport)
+	}
+
+	_, err = tr.DialContext(context.Background(), "tcp", ln.Addr().String())
+	if err == nil {
+		t.Fatal("default transport dialled a reachable loopback address; dial guard is not wired")
+	}
+	if !strings.Contains(err.Error(), "non-public address") {
+		t.Errorf("dial failed for the wrong reason: %v", err)
+	}
+}
+
+// An inherited proxy would make the dial guard blind: Control would only ever
+// see the proxy's address, never the real target, silently reinstating the
+// DNS-rebinding bypass.
+func TestCIMDFetcher_DefaultTransportDoesNotUseProxy(t *testing.T) {
+	f := NewCIMDFetcher()
+	tr := f.HTTPClient.Transport.(*http.Transport)
+	if tr.Proxy != nil {
+		t.Error("default transport inherits a proxy, which bypasses the dial guard")
+	}
+}
+
 func TestCIMDFetcher_Fetch_Caches(t *testing.T) {
 	hits := 0
 	var metadataURL string
@@ -132,6 +270,68 @@ func TestCIMDFetcher_Fetch_Caches(t *testing.T) {
 	}
 	if hits != 1 {
 		t.Errorf("expected 1 upstream hit due to caching, got %d", hits)
+	}
+}
+
+// newCIMDPathServer serves a valid metadata document at every path, each
+// echoing its own URL, so a single server can back many distinct client_ids.
+func newCIMDPathServer(t *testing.T) (*CIMDFetcher, string) {
+	t.Helper()
+	var base string
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"client_id": %q, "client_name": "x", "redirect_uris": ["http://localhost:3000/cb"]}`, base+r.URL.Path)
+	}))
+	base = ts.URL
+	t.Cleanup(ts.Close)
+	fetcher := NewCIMDFetcher()
+	fetcher.HTTPClient = ts.Client()
+	fetcher.AllowPrivateHosts = true // httptest listens on 127.0.0.1
+	return fetcher, ts.URL
+}
+
+func TestCIMDFetcher_Cache_BoundedByMaxEntries(t *testing.T) {
+	fetcher, base := newCIMDPathServer(t)
+
+	for i := 0; i < cimdMaxCacheEntries+10; i++ {
+		u := fmt.Sprintf("%s/client-%d.json", base, i)
+		if _, err := fetcher.Fetch(context.Background(), u); err != nil {
+			t.Fatalf("fetch %d failed: %v", i, err)
+		}
+	}
+
+	fetcher.mu.Lock()
+	size := len(fetcher.cache)
+	fetcher.mu.Unlock()
+	if size > cimdMaxCacheEntries {
+		t.Errorf("cache holds %d entries, want at most %d", size, cimdMaxCacheEntries)
+	}
+	// Without a lower bound, clearing the whole cache on every insert would
+	// pass the check above while making the cache useless.
+	if size < cimdMaxCacheEntries/2 {
+		t.Errorf("cache holds only %d entries after overflow, evicting far more than needed", size)
+	}
+}
+
+func TestCIMDFetcher_Cache_DropsExpiredEntriesOnInsert(t *testing.T) {
+	fetcher, base := newCIMDPathServer(t)
+
+	fetcher.mu.Lock()
+	fetcher.cache["https://stale.example.com/client.json"] = cimdCacheEntry{
+		client:    &ClientInfo{ClientID: "https://stale.example.com/client.json"},
+		expiresAt: time.Now().Add(-time.Minute),
+	}
+	fetcher.mu.Unlock()
+
+	if _, err := fetcher.Fetch(context.Background(), base+"/client.json"); err != nil {
+		t.Fatalf("fetch failed: %v", err)
+	}
+
+	fetcher.mu.Lock()
+	_, stillCached := fetcher.cache["https://stale.example.com/client.json"]
+	fetcher.mu.Unlock()
+	if stillCached {
+		t.Error("expired entry survived an insert, so memory is never reclaimed")
 	}
 }
 
@@ -182,6 +382,41 @@ func TestServer_AuthorizeHandler_CIMDClient(t *testing.T) {
 	w = doAuthorize(t, server, metadataURL, "https://attacker.example.com/callback")
 	if w.Code == http.StatusFound {
 		t.Error("unregistered CIMD redirect: expected rejection, got 302")
+	}
+}
+
+// RFC 8252 §7.3: native clients bind an ephemeral loopback port at request
+// time, so a redirect_uri registered without a port must match any port.
+func TestServer_AuthorizeHandler_CIMDLoopbackPortIgnored(t *testing.T) {
+	var metadataURL string
+	fetcher, u, cleanup := newCIMDTestServer(t, "/client.json", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"client_id": %q, "client_name": "Claude Code", "redirect_uris": ["http://localhost/callback", "http://127.0.0.1/callback"]}`, metadataURL)
+	})
+	defer cleanup()
+	metadataURL = u
+
+	store := NewMemoryTokenStore()
+	defer store.Close()
+	google, gcleanup := newFakeGoogleProvider(t)
+	defer gcleanup()
+	server := NewServer("http://localhost:8080", google, store, testLogger(), testTTL)
+	server.SetCIMDFetcher(fetcher)
+
+	w := doAuthorize(t, server, metadataURL, "http://localhost:3118/callback")
+	if w.Code != http.StatusFound {
+		t.Errorf("loopback redirect with ephemeral port: expected 302, got %d: %s", w.Code, w.Body.String())
+	}
+
+	w = doAuthorize(t, server, metadataURL, "http://127.0.0.1:41973/callback")
+	if w.Code != http.StatusFound {
+		t.Errorf("127.0.0.1 redirect with ephemeral port: expected 302, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// Port exemption must not extend to non-loopback hosts
+	w = doAuthorize(t, server, metadataURL, "http://localhost.evil.com:3118/callback")
+	if w.Code == http.StatusFound {
+		t.Error("non-loopback redirect: expected rejection, got 302")
 	}
 }
 

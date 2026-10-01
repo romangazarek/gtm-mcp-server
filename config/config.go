@@ -26,9 +26,16 @@ type Config struct {
 
 	// Logging
 	LogLevel string
+	// ToolGroups limits the GTM operation families advertised through MCP.
+	// Empty selects the backward-compatible default set.
+	ToolGroups []string
 
 	// Token configuration
 	AccessTokenTTL time.Duration
+
+	// TokenStorePath, when set, persists issued tokens to this JSON file so
+	// sessions survive restarts. Empty means in-memory only (the default).
+	TokenStorePath string
 
 	// AllowedHosts lists additional trusted hostnames for dynamic base URL resolution.
 	// Enables Docker-to-Docker contexts where the server is reached via internal aliases.
@@ -41,6 +48,13 @@ type Config struct {
 	// TrustProxy enables trusting X-Forwarded-For for rate limiting.
 	// Set to true when behind a reverse proxy (e.g. Caddy).
 	TrustProxy bool
+
+	// AutoRefreshMaxAge bounds the silent renewal chain. tryAutoRefresh extends a
+	// bearer in place without rotating it, so its expiry bounds nothing on its
+	// own; past this age since the token was issued the server stops renewing and
+	// answers 401, forcing the client through the refresh grant, which does
+	// rotate. See issue #79.
+	AutoRefreshMaxAge time.Duration
 }
 
 // Load reads configuration from environment variables.
@@ -59,11 +73,14 @@ func Load() (*Config, error) {
 		GoogleRedirectURI:     getEnv("GOOGLE_REDIRECT_URI", ""),
 		JWTSecret:             getEnv("JWT_SECRET", ""),
 		LogLevel:              getEnv("LOG_LEVEL", "info"),
+		ToolGroups:            getEnvList("GTM_TOOL_GROUPS"),
 		AccessTokenTTL:        getEnvDuration("ACCESS_TOKEN_TTL", 8*time.Hour),
+		TokenStorePath:        getEnv("TOKEN_STORE_PATH", ""),
 		AllowedHosts:          getEnvList("ALLOWED_HOSTS"),
 		ServiceAccountAPIKey:  getEnv("SERVICE_ACCOUNT_API_KEY", ""),
 		ServiceAccountKeyJSON: getEnv("GOOGLE_SERVICE_ACCOUNT_KEY_JSON", ""),
 		TrustProxy:            getEnvBool("TRUST_PROXY", false),
+		AutoRefreshMaxAge:     getEnvDuration("AUTH_AUTO_REFRESH_MAX_AGE", 7*24*time.Hour),
 	}
 
 	// Validation is deferred to when auth is actually needed

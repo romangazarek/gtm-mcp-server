@@ -24,10 +24,7 @@ import (
 //go:embed llms.txt
 var llmsTxt string
 
-const (
-	serverName    = "gtm-mcp-server"
-	serverVersion = "1.8.0"
-)
+const serverName = "gtm-mcp-server"
 
 func main() {
 	// Set up structured logging to stderr (stdout is reserved for MCP in stdio mode)
@@ -35,6 +32,12 @@ func main() {
 		Level: slog.LevelInfo,
 	}))
 	slog.SetDefault(logger)
+
+	serverVersion, err := parseServerVersion(serverMetadata)
+	if err != nil {
+		logger.Error("invalid embedded server metadata", "error", err)
+		os.Exit(1)
+	}
 
 	// Load configuration
 	cfg, err := config.Load()
@@ -60,9 +63,19 @@ func main() {
 	// Add logging middleware
 	server.AddReceivingMiddleware(middleware.NewLoggingMiddleware(logger))
 
-	// Register tools
-	registerTools(server)
+	toolGroups, err := gtm.ParseToolGroups(cfg.ToolGroups)
+	if err != nil {
+		logger.Error("invalid tool group configuration", "error", err)
+		os.Exit(1)
+	}
+	registerTools(server, toolGroups)
+	logger.Info("registered GTM tool groups", "groups", toolGroups.Names())
 
+	// TODO(stdio): branch here on the configured transport. In stdio mode,
+	// inject a token source at auth.SATokenSourceKey via receiving middleware
+	// and call server.Run(ctx, &mcp.StdioTransport{}) instead of serving HTTP.
+	// getClient() already resolves credentials from the context, so no tool
+	// changes are needed.
 	// Create HTTP handler for MCP
 	mcpHandler := mcp.NewStreamableHTTPHandler(func(r *http.Request) *mcp.Server {
 		return server
@@ -134,8 +147,19 @@ func main() {
 	registerLimiter := middleware.NewRateLimiter(2, 5, cfg.TrustProxy) // 2 req/s, burst 5
 
 	if oauthConfigured {
-		// Set up OAuth
-		tokenStore = auth.NewMemoryTokenStore()
+		// Set up OAuth. Use a file-backed store when a path is configured so
+		// sessions survive restarts; otherwise fall back to in-memory.
+		if cfg.TokenStorePath != "" {
+			fileStore, err := auth.NewFileTokenStore(cfg.TokenStorePath, logger)
+			if err != nil {
+				logger.Error("failed to initialize file token store", "error", err, "path", cfg.TokenStorePath)
+				os.Exit(1)
+			}
+			tokenStore = fileStore
+			logger.Info("token persistence enabled", "path", cfg.TokenStorePath)
+		} else {
+			tokenStore = auth.NewMemoryTokenStore()
+		}
 		googleProvider := auth.NewGoogleProvider(
 			cfg.GoogleClientID,
 			cfg.GoogleClientSecret,
@@ -154,7 +178,7 @@ func main() {
 
 		// MCP endpoint with REQUIRED auth middleware and body size limit
 		// Returns 401 if no valid Bearer token - triggers Claude's OAuth flow
-		authMiddleware := auth.Middleware(tokenStore, googleProvider, logger, cfg.BaseURL, cfg.AccessTokenTTL, urlResolver, saTokenSource, cfg.ServiceAccountAPIKey)
+		authMiddleware := auth.Middleware(tokenStore, googleProvider, logger, cfg.BaseURL, cfg.AccessTokenTTL, urlResolver, saTokenSource, cfg.ServiceAccountAPIKey, cfg.AutoRefreshMaxAge)
 		mux.Handle("/", authMiddleware(maxBytesHandler(5<<20, mcpHandler)))
 
 		logger.Info("OAuth configured",
@@ -183,7 +207,7 @@ func main() {
 		mux.HandleFunc("POST /token", oauthLimiter.MiddlewareFunc(oauthNotConfiguredHandler))
 		mux.HandleFunc("POST /register", registerLimiter.MiddlewareFunc(oauthNotConfiguredHandler))
 
-		s2sMiddleware := auth.Middleware(auth.NewMemoryTokenStore(), nil, logger, cfg.BaseURL, cfg.AccessTokenTTL, urlResolver, saTokenSource, cfg.ServiceAccountAPIKey)
+		s2sMiddleware := auth.Middleware(auth.NewMemoryTokenStore(), nil, logger, cfg.BaseURL, cfg.AccessTokenTTL, urlResolver, saTokenSource, cfg.ServiceAccountAPIKey, cfg.AutoRefreshMaxAge)
 		mux.Handle("/", s2sMiddleware(maxBytesHandler(5<<20, mcpHandler)))
 	} else {
 		logger.Warn("No authentication configured (no OAuth, no API key), running open")
@@ -248,9 +272,9 @@ func main() {
 }
 
 // registerTools adds MCP tools to the server.
-func registerTools(server *mcp.Server) {
+func registerTools(server *mcp.Server, groups gtm.ToolGroups) {
 	registerUtilityTools(server)
-	gtm.RegisterTools(server)
+	gtm.RegisterToolsForGroups(server, groups)
 }
 
 // maxBytesHandler wraps an http.Handler with a request body size limit.

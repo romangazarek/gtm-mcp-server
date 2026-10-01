@@ -4,7 +4,9 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"html"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -83,6 +85,11 @@ func (s *Server) AuthorizeHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if !isValidRedirectURI(redirectURI) {
+		s.errorResponse(w, "invalid_request", "Invalid redirect_uri")
+		return
+	}
+
 	// Validate redirect URI
 	// If client is registered via DCR, validate against their registered URIs
 	// Otherwise accept any syntactically valid URI (PKCE provides code binding)
@@ -95,34 +102,18 @@ func (s *Server) AuthorizeHandler(w http.ResponseWriter, r *http.Request) {
 			s.errorResponse(w, "invalid_client", "Could not resolve client_id metadata document")
 			return
 		}
-		if !slices.Contains(client.RedirectURIs, redirectURI) {
+		if !redirectURIAllowed(client.RedirectURIs, redirectURI) {
 			s.errorResponse(w, "invalid_request", "redirect_uri does not match client metadata document")
 			return
 		}
 	} else if clientID != "" {
 		if client, err := s.store.GetClient(clientID); err == nil {
 			// Client is registered, validate against registered redirect_uris
-			validRedirect := false
-			for _, uri := range client.RedirectURIs {
-				if uri == redirectURI {
-					validRedirect = true
-					break
-				}
-			}
-			if !validRedirect {
+			if !redirectURIAllowed(client.RedirectURIs, redirectURI) {
 				s.errorResponse(w, "invalid_request", "redirect_uri does not match registered URIs")
 				return
 			}
-		} else {
-			// Client not registered via DCR, fall back to default validation
-			if !isValidRedirectURI(redirectURI) {
-				s.errorResponse(w, "invalid_request", "Invalid redirect_uri")
-				return
-			}
 		}
-	} else if !isValidRedirectURI(redirectURI) {
-		s.errorResponse(w, "invalid_request", "Invalid redirect_uri")
-		return
 	}
 
 	// PKCE is required
@@ -139,6 +130,14 @@ func (s *Server) AuthorizeHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Bind this flow to the browser that started it (see statebinding.go).
+	binding, err := GenerateToken(32)
+	if err != nil {
+		s.logger.Error("failed to generate state binding", "error", err)
+		s.errorResponse(w, "server_error", "Internal server error")
+		return
+	}
+
 	// Store the auth state for later verification
 	authState := &AuthState{
 		State:        googleState,
@@ -147,6 +146,7 @@ func (s *Server) AuthorizeHandler(w http.ResponseWriter, r *http.Request) {
 		ClientID:     clientID,
 		Resource:     resource, // Store resource for audience binding
 		Issuer:       s.issuerForRequest(r),
+		BindingHash:  hashBinding(binding),
 		CreatedAt:    time.Now(),
 	}
 
@@ -158,6 +158,8 @@ func (s *Server) AuthorizeHandler(w http.ResponseWriter, r *http.Request) {
 		s.errorResponse(w, "server_error", "Internal server error")
 		return
 	}
+
+	setBindingCookie(w, binding, s.bindingRegimeIsHTTPS(authState.Issuer))
 
 	// Redirect to Google OAuth
 	googleAuthURL := s.google.AuthCodeURL(authState.State)
@@ -209,6 +211,24 @@ func (s *Server) CallbackHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The browser that completed Google consent must be the one that started
+	// the flow, or an attacker can have a victim's code minted against their
+	// own registered redirect_uri. Checked before the code is spent.
+	binding := bindingFromRequest(r, s.bindingRegimeIsHTTPS(authState.Issuer))
+	if !bindingMatches(binding, authState.BindingHash) {
+		s.logger.Error("federation state binding mismatch",
+			"client_id", authState.ClientID,
+			"has_cookie", binding != "",
+		)
+		s.errorResponse(w, "invalid_request", "Invalid or expired state")
+		return
+	}
+
+	if !isValidRedirectURI(authState.RedirectURI) {
+		s.errorResponse(w, "invalid_request", "Invalid redirect_uri")
+		return
+	}
+
 	// Exchange code with Google
 	googleToken, err := s.google.Exchange(r.Context(), code)
 	if err != nil {
@@ -225,33 +245,18 @@ func (s *Server) CallbackHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Store temporarily with the Google token (code is short-lived)
-	tempToken := &TokenInfo{
-		AccessToken: ourCode, // Temporary: using code as key
+	// Keep the code and upstream credentials out of all bearer lookups and disk snapshots.
+	codeState := &AuthorizationCode{
+		AuthState: AuthState{
+			State: ourCode, CodeVerifier: authState.CodeVerifier,
+			RedirectURI: authState.RedirectURI, ClientID: authState.ClientID,
+			Resource: authState.Resource, CreatedAt: time.Now(),
+		},
 		GoogleToken: googleToken,
-		ClientID:    authState.ClientID,
-		CreatedAt:   time.Now(),
-		ExpiresAt:   time.Now().Add(5 * time.Minute), // Code expires in 5 min
+		ExpiresAt:   time.Now().Add(5 * time.Minute),
 	}
-
-	// Store code verifier for PKCE verification
-	codeState := &AuthState{
-		State:        ourCode,
-		CodeVerifier: authState.CodeVerifier,
-		RedirectURI:  authState.RedirectURI,
-		ClientID:     authState.ClientID,
-		Resource:     authState.Resource, // Preserve resource for token endpoint
-		CreatedAt:    time.Now(),
-	}
-
-	if err := s.store.StoreState(codeState); err != nil {
-		s.logger.Error("failed to store code state", "error", err)
-		s.errorResponse(w, "server_error", "Internal server error")
-		return
-	}
-
-	if err := s.store.StoreToken(tempToken); err != nil {
-		s.logger.Error("failed to store temp token", "error", err)
+	if err := s.store.StoreAuthorizationCode(codeState); err != nil {
+		s.logger.Error("failed to store authorization code", "error", err)
 		s.errorResponse(w, "server_error", "Internal server error")
 		return
 	}
@@ -299,6 +304,8 @@ func (s *Server) CallbackHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	// Escape as a quoted HTML attribute, not a Go string. This also preserves
+	// native-app schemes without marking an arbitrary URL as template-trusted.
 	fmt.Fprintf(w, `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -318,10 +325,10 @@ p{color:#6b7280;font-size:14px;margin:0 0 24px}
   <div class="icon">&#10003;</div>
   <h1>Authentication successful</h1>
   <p>Click below to finish connecting in %s.</p>
-  <a class="btn" href=%q>Open in %s</a>
+  <a class="btn" href="%s">Open in %s</a>
 </div>
 </body>
-</html>`, editorName, finalURL, editorName)
+</html>`, editorName, html.EscapeString(finalURL), editorName)
 }
 
 // TokenHandler handles POST /token - exchanges code for tokens.
@@ -361,7 +368,7 @@ func (s *Server) handleAuthorizationCodeGrant(w http.ResponseWriter, r *http.Req
 	}
 
 	// Atomically consume the code state (single-use)
-	codeState, err := s.store.ConsumeState(code)
+	codeState, err := s.store.ConsumeAuthorizationCode(code)
 	if err != nil {
 		s.logger.Error("failed to get code state", "error", err)
 		s.tokenError(w, "invalid_grant", "Invalid or expired code")
@@ -396,17 +403,6 @@ func (s *Server) handleAuthorizationCodeGrant(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	// Get the temporary token with Google credentials
-	tempToken, err := s.store.GetTokenByAccess(code)
-	if err != nil {
-		s.logger.Error("failed to get temp token", "error", err)
-		s.tokenError(w, "invalid_grant", "Invalid or expired code")
-		return
-	}
-
-	// Clean up temporary token
-	_ = s.store.DeleteToken(code)
-
 	// Generate real tokens
 	accessToken, err := GenerateToken(32)
 	if err != nil {
@@ -428,7 +424,7 @@ func (s *Server) handleAuthorizationCodeGrant(w http.ResponseWriter, r *http.Req
 		RefreshToken:     refreshToken,
 		ExpiresAt:        time.Now().Add(s.accessTokenTTL),
 		RefreshExpiresAt: time.Now().Add(30 * 24 * time.Hour),
-		GoogleToken:      tempToken.GoogleToken,
+		GoogleToken:      codeState.GoogleToken,
 		ClientID:         codeState.ClientID,
 		CreatedAt:        time.Now(),
 	}
@@ -491,9 +487,6 @@ func (s *Server) handleRefreshTokenGrant(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// Delete old token (invalidates the old refresh token)
-	_ = s.store.DeleteToken(tokenInfo.AccessToken)
-
 	// Store new token with rotated refresh token
 	newTokenInfo := &TokenInfo{
 		AccessToken:      newAccessToken,
@@ -505,9 +498,13 @@ func (s *Server) handleRefreshTokenGrant(w http.ResponseWriter, r *http.Request)
 		CreatedAt:        time.Now(),
 	}
 
-	if err := s.store.StoreToken(newTokenInfo); err != nil {
-		s.logger.Error("failed to store new token", "error", err)
-		s.tokenError(w, "server_error", "Internal server error")
+	if err := s.store.RotateToken(refreshToken, newTokenInfo); err != nil {
+		if errors.Is(err, ErrTokenNotFound) || errors.Is(err, ErrTokenExpired) {
+			s.tokenError(w, "invalid_grant", "Invalid refresh token")
+		} else {
+			s.logger.Error("failed to rotate token", "error", err)
+			s.tokenError(w, "server_error", "Internal server error")
+		}
 		return
 	}
 
@@ -547,31 +544,54 @@ func (s *Server) errorResponse(w http.ResponseWriter, errCode, errDesc string) {
 	http.Error(w, fmt.Sprintf("%s: %s", errCode, errDesc), http.StatusBadRequest)
 }
 
-// isValidRedirectURI validates redirect URIs for non-DCR clients.
-// This is permissive because PKCE (required) binds the authorization code to the
-// client's code_verifier, making authorization code interception attacks infeasible
-// even with an attacker-controlled redirect URI. See RFC 7636 and RFC 8252.
-//
-// Blocked: javascript/data URIs (XSS), plaintext http to non-localhost (code leakage).
+func isLoopbackHost(h string) bool {
+	return h == "localhost" || h == "127.0.0.1" || h == "::1"
+}
+
+// redirectURIAllowed reports whether candidate matches one of the registered
+// URIs. Per RFC 8252 section 7.3, http loopback redirects match on scheme,
+// host and path only, since native clients bind an ephemeral port at request
+// time. All other URIs require an exact match.
+func redirectURIAllowed(registered []string, candidate string) bool {
+	if !isValidRedirectURI(candidate) {
+		return false
+	}
+	if slices.Contains(registered, candidate) {
+		return true
+	}
+	u, err := url.Parse(candidate)
+	if err != nil || u.Scheme != "http" || !isLoopbackHost(u.Hostname()) {
+		return false
+	}
+	for _, r := range registered {
+		ru, err := url.Parse(r)
+		if err != nil || ru.Scheme != "http" || !isLoopbackHost(ru.Hostname()) {
+			continue
+		}
+		if ru.Hostname() == u.Hostname() && ru.Path == u.Path {
+			return true
+		}
+	}
+	return false
+}
+
+// isValidRedirectURI is shared by all client types and callback rendering.
+// It accepts HTTPS, loopback HTTP and hierarchical native-app redirects; opaque
+// URLs, browser-executable schemes and fragments are not OAuth redirect targets.
 func isValidRedirectURI(uri string) bool {
 	parsed, err := url.Parse(uri)
-	if err != nil || parsed.Scheme == "" {
+	if err != nil || parsed.Scheme == "" || parsed.Opaque != "" || parsed.User != nil || parsed.Fragment != "" || strings.Contains(uri, "#") {
 		return false
 	}
-
-	scheme := strings.ToLower(parsed.Scheme)
-
-	// Block dangerous schemes
-	if scheme == "javascript" || scheme == "data" {
+	switch strings.ToLower(parsed.Scheme) {
+	case "javascript", "data", "vbscript", "file", "filesystem", "blob", "about":
 		return false
+	case "http":
+		return isLoopbackHost(parsed.Hostname())
+	case "https":
+		return parsed.Hostname() != ""
+	default:
+		// Native applications may use either app://host/path or app:/path.
+		return parsed.Hostname() != "" || strings.HasPrefix(parsed.Path, "/")
 	}
-
-	// For http, only allow localhost to prevent plaintext code leakage
-	if scheme == "http" {
-		hostname := parsed.Hostname()
-		return hostname == "localhost" || hostname == "127.0.0.1"
-	}
-
-	// Allow https, and custom schemes (e.g. cursor://, vscode://) per RFC 8252
-	return true
 }
